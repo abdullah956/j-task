@@ -7,16 +7,54 @@ services:
       dockerfile: Dockerfile
     container_name: shopnest-backend
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:${BACKEND_PORT:-8000}"
+    env_file:
+      - .env
     environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - MODEL_NAME=mistral
+      # Groq API Configuration
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
+      - GROQ_TEMPERATURE=${GROQ_TEMPERATURE:-0.7}
+      - GROQ_MAX_TOKENS=${GROQ_MAX_TOKENS:-512}
+
+      # Backend Configuration
+      - BACKEND_HOST=${BACKEND_HOST:-0.0.0.0}
+      - BACKEND_PORT=${BACKEND_PORT:-8000}
+      - BACKEND_RELOAD=${BACKEND_RELOAD:-true}
+      - BACKEND_LOG_LEVEL=${BACKEND_LOG_LEVEL:-info}
+
+      # Frontend Configuration
+      - FRONTEND_PORT=${FRONTEND_PORT:-5173}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:5173}
+
+      # CORS Configuration
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173}
+      - CORS_ALLOW_CREDENTIALS=${CORS_ALLOW_CREDENTIALS:-true}
+      - CORS_ALLOW_METHODS=${CORS_ALLOW_METHODS:-*}
+      - CORS_ALLOW_HEADERS=${CORS_ALLOW_HEADERS:-*}
+
+      # RAG Configuration
+      - RAG_CHUNK_SIZE=${RAG_CHUNK_SIZE:-300}
+      - RAG_CHUNK_OVERLAP=${RAG_CHUNK_OVERLAP:-50}
+      - RAG_RETRIEVAL_K=${RAG_RETRIEVAL_K:-3}
+      - RAG_EMBEDDING_MODEL=${RAG_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - RAG_EMBEDDING_DEVICE=${RAG_EMBEDDING_DEVICE:-cpu}
+
+      # Database Configuration
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./shopnest.db}
+
+      # Cache Configuration
+      - SENTENCE_TRANSFORMERS_HOME=${SENTENCE_TRANSFORMERS_HOME:-/app/.cache}
+      - HF_HOME=${HF_HOME:-/app/.cache}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
+
+      # System Configuration
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./backend:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      - ./backend/faiss_index:/app/faiss_index
+      - model-cache:/app/.cache
     restart: unless-stopped
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     networks:
       - app-network
 
@@ -26,9 +64,9 @@ services:
       dockerfile: Dockerfile
     container_name: shopnest-frontend
     ports:
-      - "5173:5173"
+      - "${FRONTEND_PORT:-5173}:${FRONTEND_PORT:-5173}"
     environment:
-      - VITE_API_URL=http://localhost:8000
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
     depends_on:
       - backend
     restart: unless-stopped
@@ -38,3 +76,6 @@ services:
 networks:
   app-network:
     driver: bridge
+
+volumes:
+  model-cache:

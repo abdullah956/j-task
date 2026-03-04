@@ -5,6 +5,7 @@ Provides WebSocket streaming for real-time chat interactions
 
 import sys
 import json
+import traceback
 from pathlib import Path
 from typing import Dict, Any
 
@@ -15,6 +16,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import HumanMessage
 
+from config import Config
 from agent.graph import compiled_graph
 from agent.memory import add_message, get_history
 from agent import rag  # Import to trigger RAG initialization
@@ -25,10 +27,10 @@ app = FastAPI(title="ShopNest AI Support Agent API")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=Config.CORS_ORIGINS,
+    allow_credentials=Config.CORS_ALLOW_CREDENTIALS,
+    allow_methods=Config.CORS_ALLOW_METHODS,
+    allow_headers=Config.CORS_ALLOW_HEADERS,
 )
 
 
@@ -105,38 +107,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     "context": ""
                 }
 
-                # Stream response from LangGraph
+                # Run graph and get response
+                # Note: Since Groq is called directly (not via LangChain),
+                # streaming happens at the Groq API level, not LangGraph level
                 full_response = ""
 
                 try:
-                    # Use astream_events for token streaming (v2)
-                    async for event in compiled_graph.astream_events(
-                        input_state,
-                        version="v2"
-                    ):
-                        # Filter for chat model streaming events
-                        event_type = event.get("event", "")
-
-                        if event_type == "on_chat_model_stream":
-                            # Extract token content
-                            chunk = event.get("data", {}).get("chunk", {})
-
-                            if hasattr(chunk, "content"):
-                                token = chunk.content
-                            elif isinstance(chunk, dict):
-                                token = chunk.get("content", "")
-                            else:
-                                token = str(chunk)
-
-                            if token:
-                                # Send token to client
-                                await websocket.send_text(token)
-                                full_response += token
-
-                except Exception as stream_error:
-                    print(f"⚠️ Streaming error: {stream_error}")
-
-                    # Fallback: run graph without streaming
+                    # Run the graph
                     result = compiled_graph.invoke(input_state)
 
                     # Extract AI response from result
@@ -147,6 +124,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                         # Send full response
                         await websocket.send_text(full_response)
+
+                except Exception as error:
+                    print(f"❌ Graph execution error: {error}")
+                    traceback.print_exc()
+
+                    error_msg = "I apologize, but I'm having trouble processing your request. Please try again."
+                    await websocket.send_text(error_msg)
+                    full_response = error_msg
 
                 # Save AI response to memory
                 if full_response:
@@ -162,7 +147,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 }))
             except Exception as e:
                 print(f"❌ Error processing message: {e}")
-                import traceback
                 traceback.print_exc()
 
                 await websocket.send_text(json.dumps({
@@ -174,7 +158,6 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         print(f"🔌 WebSocket disconnected for session: {session_id}")
     except Exception as e:
         print(f"❌ WebSocket error for session {session_id}: {e}")
-        import traceback
         traceback.print_exc()
     finally:
         print(f"🔒 WebSocket closed for session: {session_id}")
@@ -205,15 +188,12 @@ if __name__ == "__main__":
     print("\n" + "="*80)
     print("🚀 Starting ShopNest AI Support Agent Server")
     print("="*80)
-    print("📡 Server will be available at: http://localhost:8000")
-    print("📡 WebSocket endpoint: ws://localhost:8000/ws/{session_id}")
-    print("📚 API Documentation: http://localhost:8000/docs")
+    print(f"📡 Server will be available at: http://localhost:{Config.BACKEND_PORT}")
+    print(f"📡 WebSocket endpoint: ws://localhost:{Config.BACKEND_PORT}/ws/{{session_id}}")
+    print(f"📚 API Documentation: http://localhost:{Config.BACKEND_PORT}/docs")
     print("="*80 + "\n")
 
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
+        **Config.get_uvicorn_config()
     )

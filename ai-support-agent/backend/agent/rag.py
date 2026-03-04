@@ -3,10 +3,17 @@ RAG (Retrieval Augmented Generation) module for ShopNest AI Support Agent
 Uses FAISS vector store with sentence-transformers for semantic search
 """
 
+import sys
 from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+
+from config import Config
 
 # Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -36,18 +43,19 @@ def load_faq_documents():
     return content
 
 
-def chunk_documents(text: str, chunk_size: int = 300, chunk_overlap: int = 50):
+def chunk_documents(text: str):
     """
     Split text into chunks using RecursiveCharacterTextSplitter
 
     Args:
         text: Text content to split
-        chunk_size: Maximum size of each chunk
-        chunk_overlap: Number of characters to overlap between chunks
 
     Returns:
         list[str]: List of text chunks
     """
+    chunk_size = Config.RAG_CHUNK_SIZE
+    chunk_overlap = Config.RAG_CHUNK_OVERLAP
+
     print(f"✂️  Chunking text with size={chunk_size}, overlap={chunk_overlap}")
 
     text_splitter = RecursiveCharacterTextSplitter(
@@ -70,11 +78,11 @@ def create_embeddings_model():
     Returns:
         HuggingFaceEmbeddings: Embedding model instance
     """
-    print("🤖 Loading sentence-transformers model: all-MiniLM-L6-v2")
+    print(f"🤖 Loading sentence-transformers model: {Config.RAG_EMBEDDING_MODEL}")
 
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'},
+        model_name=Config.RAG_EMBEDDING_MODEL,
+        model_kwargs={'device': Config.RAG_EMBEDDING_DEVICE},
         encode_kwargs={'normalize_embeddings': True}
     )
 
@@ -170,7 +178,7 @@ def initialize_rag_system():
         faq_content = load_faq_documents()
 
         # Chunk the content
-        chunks = chunk_documents(faq_content, chunk_size=300, chunk_overlap=50)
+        chunks = chunk_documents(faq_content)
 
         # Build FAISS index
         vector_store = build_faiss_index(chunks, embeddings)
@@ -185,13 +193,13 @@ def initialize_rag_system():
     return vector_store
 
 
-def retrieve_relevant_chunks(query: str, k: int = 3) -> list[str]:
+def retrieve_relevant_chunks(query: str, k: int = None) -> list[str]:
     """
     Retrieve the top-k most relevant text chunks for a given query
 
     Args:
         query: User query string
-        k: Number of top results to return (default: 3)
+        k: Number of top results to return (uses Config.RAG_RETRIEVAL_K if not provided)
 
     Returns:
         list[str]: List of relevant text chunks
@@ -200,6 +208,9 @@ def retrieve_relevant_chunks(query: str, k: int = 3) -> list[str]:
 
     if vector_store is None:
         raise RuntimeError("RAG system not initialized. Call initialize_rag_system() first.")
+
+    if k is None:
+        k = Config.RAG_RETRIEVAL_K
 
     print(f"🔍 Searching for top {k} relevant chunks for query: '{query[:50]}...'")
 

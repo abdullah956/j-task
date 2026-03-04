@@ -3,8 +3,8 @@ LangGraph-based AI support agent for ShopNest
 Combines RAG retrieval, tool usage, and conversational flow
 """
 
-import os
 import sys
+import traceback
 from pathlib import Path
 from typing_extensions import TypedDict
 
@@ -14,11 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolExecutor, ToolInvocation
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, FunctionMessage
-from langchain_community.chat_models import ChatOllama
 from langchain_core.utils.function_calling import convert_to_openai_function
+from groq import Groq
 
+from config import Config
 from agent.tools import TOOLS
 from agent.rag import retrieve_relevant_chunks
+from utils.helpers import extract_order_id, is_order_tracking_query, format_error_message
 
 
 # Define the agent state
@@ -27,14 +29,11 @@ class AgentState(TypedDict):
     messages: list
     session_id: str
     context: str
+    _handled: bool  # Flag to skip agent node if already handled
 
 
-# Initialize LLM with local Ollama
-llm = ChatOllama(
-    model="mistral",
-    temperature=0.7,
-    base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-)
+# Initialize Groq client
+groq_client = Groq(api_key=Config.GROQ_API_KEY)
 
 # Initialize tool executor
 tool_executor = ToolExecutor(TOOLS)
@@ -46,6 +45,7 @@ tool_definitions = [convert_to_openai_function(tool) for tool in TOOLS]
 def retrieve_context_node(state: AgentState) -> AgentState:
     """
     Retrieve relevant FAQ context based on the last human message
+    Also detects order tracking requests and handles them directly
 
     Args:
         state: Current agent state
@@ -62,15 +62,40 @@ def retrieve_context_node(state: AgentState) -> AgentState:
             last_human_message = message.content
             break
 
-    # Retrieve relevant chunks from FAQ
+    # Check if this is an order tracking request
+    if last_human_message and is_order_tracking_query(last_human_message):
+        order_id = extract_order_id(last_human_message)
+        if order_id:
+            # Execute the tool directly
+            from agent.tools import get_order_status
+            try:
+                result = get_order_status(order_id)
+                formatted_response = f"I found your order! Here are the details:\n\n{result}"
+
+                # Add AI response with the order details
+                state["messages"] = messages + [AIMessage(content=formatted_response)]
+                state["context"] = ""  # No FAQ context needed
+
+                # Mark that we handled this (skip agent node)
+                state["_handled"] = True
+                return state
+
+            except Exception as e:
+                error_msg = f"Sorry, I couldn't retrieve that order: {str(e)}"
+                state["messages"] = messages + [AIMessage(content=error_msg)]
+                state["_handled"] = True
+                return state
+
+    # Normal FAQ handling - retrieve relevant chunks
     if last_human_message:
-        relevant_chunks = retrieve_relevant_chunks(last_human_message, k=3)
+        relevant_chunks = retrieve_relevant_chunks(last_human_message)
         context = "\n\n".join(relevant_chunks)
     else:
         context = ""
 
     # Update state with context
     state["context"] = context
+    state["_handled"] = False
 
     return state
 
@@ -89,30 +114,57 @@ def agent_node(state: AgentState) -> AgentState:
     context = state.get("context", "")
     messages = state.get("messages", [])
 
-    # Build system prompt with tool information
-    tools_desc = "\n".join([
-        f"- {tool.name}: {tool.description}" for tool in TOOLS
-    ])
-
+    # Build system prompt
     system_prompt = f"""You are a helpful customer support agent for ShopNest, an e-commerce company.
 
-Use the following FAQ context to answer policy questions:
+CRITICAL RULE #1 - TOOL CALLING (HIGHEST PRIORITY):
+If the user's message contains a specific ORDER ID (a 4-digit number like 1001, 1002, etc.) AND asks about order status/tracking/location, you MUST respond with EXACTLY:
+TOOL_CALL: get_order_status XXXX
+
+Replace XXXX with the order ID. DO NOT add anything else. Just that one line.
+
+Examples:
+- User: "track order 1001" → You: "TOOL_CALL: get_order_status 1001"
+- User: "what's the status of 1003?" → You: "TOOL_CALL: get_order_status 1003"
+- User: "where is my order 1005" → You: "TOOL_CALL: get_order_status 1005"
+
+RULE #2 - FAQ QUESTIONS:
+For general questions WITHOUT a specific order ID (like "how do I track orders?", "what's your return policy?"), use this FAQ context:
 {context}
 
-Available tools:
-{tools_desc}
+IMPORTANT: If there's an order ID in the message, IGNORE the FAQ context and use TOOL_CALL instead!
 
-If the user asks about an order, use the get_order_status tool.
 Be concise, friendly, and helpful."""
 
-    # Prepare messages for LLM (include system message)
-    llm_messages = [SystemMessage(content=system_prompt)] + messages
+    # Convert LangChain messages to Groq format
+    groq_messages = [{"role": "system", "content": system_prompt}]
 
-    # Call LLM
-    response = llm.invoke(llm_messages)
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            groq_messages.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage):
+            groq_messages.append({"role": "assistant", "content": msg.content})
 
-    # Add AI response to messages
-    state["messages"] = messages + [response]
+    # Call Groq API (non-streaming for LangGraph compatibility)
+    try:
+        completion = groq_client.chat.completions.create(
+            model=Config.GROQ_MODEL,
+            messages=groq_messages,
+            temperature=Config.GROQ_TEMPERATURE,
+            max_tokens=Config.GROQ_MAX_TOKENS,
+            stream=False,  # LangGraph handles streaming at a higher level
+        )
+
+        response_content = completion.choices[0].message.content
+
+        # Add AI response to messages
+        state["messages"] = messages + [AIMessage(content=response_content)]
+
+    except Exception as e:
+        print(f"❌ Groq API Error: {e}")
+        traceback.print_exc()
+        error_msg = format_error_message(e, "Groq API")
+        state["messages"] = messages + [AIMessage(content=error_msg)]
 
     return state
 
@@ -137,61 +189,79 @@ def tool_node(state: AgentState) -> AgentState:
     if not isinstance(last_message, AIMessage):
         return state
 
-    content = last_message.content.lower()
+    content = last_message.content
 
-    # Simple tool detection - look for order IDs in format like "1001", "1002", etc.
-    if "order" in content or "track" in content or "status" in content:
-        # Extract order ID from content (simple regex-like extraction)
-        import re
-        order_match = re.search(r'\b(\d{4})\b', last_message.content)
+    # Look for explicit tool call pattern
+    import re
+    tool_call_pattern = r'TOOL_CALL:\s*get_order_status\s+(\d{4})'
+    tool_call_match = re.search(tool_call_pattern, content)
 
-        if order_match:
-            order_id = order_match.group(1)
+    if tool_call_match:
+        order_id = tool_call_match.group(1)
 
-            # Execute get_order_status tool
-            tool_invocation = ToolInvocation(
-                tool="get_order_status",
-                tool_input={"order_id": order_id}
-            )
+        # Execute get_order_status tool
+        tool_invocation = ToolInvocation(
+            tool="get_order_status",
+            tool_input={"order_id": order_id}
+        )
 
-            try:
-                result = tool_executor.invoke(tool_invocation)
+        try:
+            result = tool_executor.invoke(tool_invocation)
 
-                # Create function message with result
-                function_message = FunctionMessage(
-                    name="get_order_status",
-                    content=str(result)
-                )
+            # Format the result nicely for the user
+            formatted_response = f"I found your order! Here are the details:\n\n{result}"
 
-                # Add tool result to messages
-                state["messages"] = messages + [function_message]
+            # Replace the last AI message (the TOOL_CALL) with the actual result
+            # Remove the TOOL_CALL message and add the formatted result
+            state["messages"] = messages[:-1] + [AIMessage(content=formatted_response)]
 
-                # Add an AI message acknowledging the tool result
-                ai_followup = AIMessage(content=str(result))
-                state["messages"] = state["messages"] + [ai_followup]
-
-            except Exception as e:
-                error_msg = AIMessage(content=f"Error executing tool: {str(e)}")
-                state["messages"] = messages + [error_msg]
+        except Exception as e:
+            error_msg = f"Sorry, I couldn't retrieve that order: {str(e)}"
+            state["messages"] = messages[:-1] + [AIMessage(content=error_msg)]
 
     return state
 
 
-def should_continue(_state: AgentState) -> str:
+def should_continue(state: AgentState) -> str:
     """
     Determine if we should continue to tools or end
 
-    For this simplified version, we always end after agent response
-    since we don't have proper tool call detection in older LangChain versions.
+    Checks if we should execute tools based on message count to avoid loops.
 
     Args:
-        _state: Current agent state (unused in this simplified version)
+        state: Current agent state
 
     Returns:
-        str: "end" to finish the conversation turn
+        str: "tools" to execute tools, "end" to finish
     """
-    # In a more advanced version with tool support, we would check for tool calls here
-    # For now, we always end after the agent responds
+    messages = state.get("messages", [])
+    if len(messages) < 2:
+        return "end"
+
+    # Count AI messages - if we have 2+, we've already done agent→tools→agent loop
+    ai_count = sum(1 for msg in messages if isinstance(msg, AIMessage))
+
+    # If we have 2+ AI messages, we've completed the tool loop, so end
+    if ai_count >= 2:
+        return "end"
+
+    # Get last human message
+    last_human = None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            last_human = msg
+            break
+
+    if not last_human:
+        return "end"
+
+    # Check if user asks about an order with ID
+    if is_order_tracking_query(last_human.content):
+        if extract_order_id(last_human.content):
+            # Only go to tools if this is the first AI response
+            if ai_count == 1:
+                return "tools"
+
     return "end"
 
 
@@ -211,12 +281,23 @@ def create_support_agent_graph():
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", tool_node)
 
+    # Helper function to check if order was handled in retrieve_context
+    def check_if_handled(state: AgentState) -> str:
+        return "end" if state.get("_handled", False) else "agent"
+
     # Define edges
     # Set entry point → retrieve_context_node
     workflow.set_entry_point("retrieve_context")
 
-    # retrieve_context_node → agent_node
-    workflow.add_edge("retrieve_context", "agent")
+    # retrieve_context_node → check if already handled → agent or end
+    workflow.add_conditional_edges(
+        "retrieve_context",
+        check_if_handled,
+        {
+            "agent": "agent",
+            "end": END
+        }
+    )
 
     # agent_node → END (simplified - no tool loop in this version)
     workflow.add_conditional_edges(
