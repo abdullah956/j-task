@@ -100,21 +100,17 @@ def retrieve_context_node(state: AgentState) -> AgentState:
     return state
 
 
-def agent_node(state: AgentState) -> AgentState:
+def build_groq_messages(context: str, messages: list) -> tuple[str, list]:
     """
-    Main agent reasoning node - builds prompt and calls LLM
+    Build system prompt and Groq-formatted messages
 
     Args:
-        state: Current agent state
+        context: FAQ context from RAG
+        messages: LangChain message history
 
     Returns:
-        AgentState: Updated state with new AI message
+        tuple: (system_prompt, groq_messages)
     """
-    # Get context and messages from state
-    context = state.get("context", "")
-    messages = state.get("messages", [])
-
-    # Build system prompt
     system_prompt = f"""You are a helpful customer support agent for ShopNest, an e-commerce company.
 
 CRITICAL RULE #1 - TOOL CALLING (HIGHEST PRIORITY):
@@ -145,6 +141,26 @@ Be concise, friendly, and helpful."""
         elif isinstance(msg, AIMessage):
             groq_messages.append({"role": "assistant", "content": msg.content})
 
+    return system_prompt, groq_messages
+
+
+def agent_node(state: AgentState) -> AgentState:
+    """
+    Main agent reasoning node - builds prompt and calls LLM
+
+    Args:
+        state: Current agent state
+
+    Returns:
+        AgentState: Updated state with new AI message
+    """
+    # Get context and messages from state
+    context = state.get("context", "")
+    messages = state.get("messages", [])
+
+    # Build prompt and messages
+    _, groq_messages = build_groq_messages(context, messages)
+
     # Call Groq API (non-streaming for LangGraph compatibility)
     try:
         completion = groq_client.chat.completions.create(
@@ -152,7 +168,7 @@ Be concise, friendly, and helpful."""
             messages=groq_messages,
             temperature=Config.GROQ_TEMPERATURE,
             max_tokens=Config.GROQ_MAX_TOKENS,
-            stream=False,  # LangGraph handles streaming at a higher level
+            stream=False,  # Non-streaming for LangGraph
         )
 
         response_content = completion.choices[0].message.content
@@ -167,6 +183,43 @@ Be concise, friendly, and helpful."""
         state["messages"] = messages + [AIMessage(content=error_msg)]
 
     return state
+
+
+async def stream_agent_response(context: str, messages: list):
+    """
+    Stream LLM response token by token (for WebSocket streaming)
+
+    This bypasses LangGraph and calls Groq directly with streaming enabled.
+
+    Args:
+        context: FAQ context from RAG
+        messages: LangChain message history
+
+    Yields:
+        str: Token chunks from the LLM
+    """
+    # Build prompt and messages
+    _, groq_messages = build_groq_messages(context, messages)
+
+    try:
+        # Call Groq API with streaming enabled
+        completion = groq_client.chat.completions.create(
+            model=Config.GROQ_MODEL,
+            messages=groq_messages,
+            temperature=Config.GROQ_TEMPERATURE,
+            max_tokens=Config.GROQ_MAX_TOKENS,
+            stream=True,  # Enable streaming!
+        )
+
+        # Yield each token as it arrives
+        for chunk in completion:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    except Exception as e:
+        print(f"❌ Groq API Streaming Error: {e}")
+        traceback.print_exc()
+        yield format_error_message(e, "Groq API")
 
 
 def tool_node(state: AgentState) -> AgentState:
